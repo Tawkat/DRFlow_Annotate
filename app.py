@@ -7,7 +7,8 @@ import re
 from pathlib import Path
 
 import pandas as pd
-from flask import Flask, jsonify, render_template, request
+from io import BytesIO
+from flask import Flask, jsonify, render_template, request, send_file
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR.parent / "data" / "labeling"
@@ -254,6 +255,45 @@ def annotate():
     df.loc[mask, col] = value
     _save_df(df)
     return jsonify({"ok": True, "task_id": task_id, "value": value})
+
+
+@app.route("/api/export")
+def export_excel():
+    """Download current questions + all annotations from SQLite as an Excel file (for Railway/live DB)."""
+    if not _use_sqlite():
+        return jsonify({"error": "Export only available when using SQLite (e.g. on Railway)"}), 400
+    import sqlite3
+    _ensure_sqlite_seeded()
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        questions = pd.read_sql_query(
+            "SELECT task_id, dr_question, domain FROM questions ORDER BY task_id",
+            conn,
+        )
+        if questions.empty:
+            return jsonify({"error": "No questions in database"}), 404
+        annotations = pd.read_sql_query(
+            "SELECT annotator_id, task_id, value FROM annotations",
+            conn,
+        )
+    finally:
+        conn.close()
+    df = questions.copy()
+    if not annotations.empty:
+        pivot = annotations.pivot(
+            index="task_id", columns="annotator_id", values="value"
+        ).fillna(0).astype(int)
+        for col in pivot.columns:
+            df[col] = df["task_id"].map(pivot[col]).fillna(0).astype(int)
+    buf = BytesIO()
+    df.to_excel(buf, index=False, engine="openpyxl", sheet_name=SHEET_NAME)
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="dr_questions_annotations.xlsx",
+    )
 
 
 if __name__ == "__main__":
