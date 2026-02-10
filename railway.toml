@@ -1,0 +1,10 @@
+# Railway.app deployment for DR Question Annotation UI
+# See README for setup: add a Volume and set ANNOTATION_DB to the volume path.
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "gunicorn app:app --bind 0.0.0.0:$PORT"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
