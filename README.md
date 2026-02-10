@@ -49,6 +49,23 @@ Open http://127.0.0.1:5050
 3. Click 👍 for +1, 👎 for -1. Click the same icon again or double-click to clear (0).
 4. Annotations are stored per annotator in SQLite (or Excel when not using SQLite).
 
+## Download annotations as Excel
+
+**Why GitHub’s `annotations.db` is not updated:** On Railway, the database lives on a **volume** on Railway’s servers (e.g. `/data/annotations.db`). It is not in your GitHub repo, so any file you see in the repo is an old or empty copy.
+
+**Get the current annotations as Excel from the live app:**
+
+- Open your Railway app in the browser, then go to:  
+  **`https://your-app.railway.app/api/export`**  
+  (replace with your real Railway URL).  
+  That endpoint returns the current questions and all annotator columns as an Excel file (`dr_questions_annotations.xlsx`).
+
+**Locally (from a local `annotations.db`):**
+
+```bash
+python read_sql2excel.py --db data/annotations.db --output my_export.xlsx
+```
+
 ## Dependencies
 
 - Flask, pandas, openpyxl, gunicorn (see `requirements.txt`)
