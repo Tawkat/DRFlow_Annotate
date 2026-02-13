@@ -14,7 +14,34 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR.parent / "data" / "labeling"
 EXCEL_PATH = DATA_DIR / "dr_questions.xlsx"
 SHEET_NAME = "dr_questions"
-BASE_COLUMNS = ["task_id", "dr_question", "domain"]
+
+# All columns expected in the questions table / Excel
+QUESTION_COLUMNS = [
+    "task_id",
+    "dr_question",
+    "domain",
+    "company_name",
+    "company_industry",
+    "company_description",
+    "company_size",
+    "company_employee_count",
+    "company_annual_revenue",
+    "company_persona",
+    "company_persona_email",
+    "company_persona_role",
+    "company_persona_role_description",
+    "user_name",
+    "user_role",
+    "user_email",
+    "user_role_description",
+    "user_company",
+    "user_industry",
+    "user_company_description",
+    "user_company_size",
+    "user_company_employee_count",
+    "user_company_annual_revenue",
+]
+REQUIRED_COLUMNS = ["task_id", "dr_question", "domain"]
 
 # SQLite: use if file exists or ANNOTATION_DB is set (e.g. Railway volume at /data/annotations.db)
 DB_PATH = Path(os.environ.get("ANNOTATION_DB", str(APP_DIR / "data" / "annotations.db")))
@@ -45,18 +72,42 @@ def _get_db():
     return sqlite3.connect(str(DB_PATH))
 
 
+def _build_questions_ddl() -> str:
+    """Build CREATE TABLE DDL for questions with all columns."""
+    col_defs = []
+    for col in QUESTION_COLUMNS:
+        if col == "task_id":
+            col_defs.append("task_id TEXT PRIMARY KEY")
+        elif col in REQUIRED_COLUMNS:
+            col_defs.append(f"{col} TEXT NOT NULL")
+        else:
+            col_defs.append(f"{col} TEXT DEFAULT ''")
+    return (
+        "CREATE TABLE IF NOT EXISTS questions (\n"
+        + ",\n".join(f"    {d}" for d in col_defs)
+        + "\n);"
+    )
+
+
+def _migrate_add_columns(conn) -> None:
+    """Add any new columns that don't exist yet (for existing DBs with the old 3-column schema)."""
+    cur = conn.execute("PRAGMA table_info(questions)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    for col in QUESTION_COLUMNS:
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE questions ADD COLUMN {col} TEXT DEFAULT ''")
+    conn.commit()
+
+
 def _ensure_sqlite_seeded() -> None:
     """If DB has no questions, create schema and seed from bundled Excel (for Railway etc.)."""
     import sqlite3
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     try:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS questions (
-                task_id TEXT PRIMARY KEY,
-                dr_question TEXT NOT NULL,
-                domain TEXT NOT NULL
-            );
+        questions_ddl = _build_questions_ddl()
+        conn.executescript(f"""
+            {questions_ddl}
             CREATE TABLE IF NOT EXISTS annotations (
                 annotator_id TEXT NOT NULL,
                 task_id TEXT NOT NULL,
@@ -68,25 +119,36 @@ def _ensure_sqlite_seeded() -> None:
             CREATE INDEX IF NOT EXISTS idx_annotations_annotator ON annotations(annotator_id);
         """)
         conn.commit()
+        _migrate_add_columns(conn)
         row = conn.execute("SELECT COUNT(*) FROM questions").fetchone()
         if row and row[0] == 0 and BUNDLED_EXCEL.exists():
-            import pandas as pd
-            df = pd.read_excel(BUNDLED_EXCEL, engine="openpyxl", sheet_name=SHEET_NAME)
+            import pandas as _pd
+            df = _pd.read_excel(BUNDLED_EXCEL, engine="openpyxl", sheet_name=SHEET_NAME)
+            available_cols = [c for c in QUESTION_COLUMNS if c in df.columns]
+            placeholders = ", ".join("?" for _ in available_cols)
+            col_names = ", ".join(available_cols)
+            sql = f"INSERT OR REPLACE INTO questions ({col_names}) VALUES ({placeholders})"
             for _, r in df.iterrows():
-                conn.execute(
-                    "INSERT OR REPLACE INTO questions (task_id, dr_question, domain) VALUES (?, ?, ?)",
-                    (str(r["task_id"]), str(r.get("dr_question", "")), str(r.get("domain", ""))),
-                )
+                values = []
+                for col in available_cols:
+                    val = r[col]
+                    if _pd.notna(val):
+                        values.append(str(val).strip())
+                    else:
+                        values.append("")
+                conn.execute(sql, values)
             conn.commit()
     finally:
         conn.close()
 
 
 def _questions_from_sqlite() -> list[dict]:
+    """Return all questions with ALL columns from SQLite."""
+    col_list = ", ".join(QUESTION_COLUMNS)
     with _get_db() as conn:
         conn.row_factory = lambda c, r: dict(zip([x[0] for x in c.description], r))
         cur = conn.execute(
-            "SELECT task_id, dr_question, domain FROM questions ORDER BY task_id"
+            f"SELECT {col_list} FROM questions ORDER BY task_id"
         )
         return [dict(row) for row in cur.fetchall()]
 
@@ -151,6 +213,15 @@ def _save_df(df: pd.DataFrame) -> None:
     df.to_excel(EXCEL_PATH, index=False, engine="openpyxl", sheet_name=SHEET_NAME)
 
 
+def _combine_user_role_info(q: dict) -> str:
+    """Combine user_role and user_role_description into a single display string."""
+    role = str(q.get("user_role", "") or "").strip()
+    desc = str(q.get("user_role_description", "") or "").strip()
+    if role and desc:
+        return f"{role} — {desc}"
+    return role or desc or ""
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -173,6 +244,7 @@ def get_questions():
             rows.append({
                 "index": i,
                 "task_id": task_id,
+                "user_role_info": _combine_user_role_info(q),
                 "domain": str(q.get("domain", "")),
                 "dr_question": str(q.get("dr_question", "")),
                 "annotation": annotations.get(task_id, 0),
@@ -183,17 +255,19 @@ def get_questions():
         df = _load_df()
     except FileNotFoundError as e:
         return jsonify({"error": str(e)}), 404
-    for col in BASE_COLUMNS:
+    for col in REQUIRED_COLUMNS:
         if col not in df.columns:
             return jsonify({"error": f"Missing column: {col}"}), 500
     annot_col = _find_annotator_column(df, user) if user else None
     rows = []
     for i, row in df.iterrows():
+        q = row.to_dict()
         item = {
             "index": int(i),
-            "task_id": str(row.get("task_id", "")),
-            "domain": str(row.get("domain", "")),
-            "dr_question": str(row.get("dr_question", "")),
+            "task_id": str(q.get("task_id", "")),
+            "user_role_info": _combine_user_role_info(q),
+            "domain": str(q.get("domain", "")),
+            "dr_question": str(q.get("dr_question", "")),
         }
         if annot_col:
             val = row.get(annot_col)
@@ -259,15 +333,16 @@ def annotate():
 
 @app.route("/api/export")
 def export_excel():
-    """Download current questions + all annotations from SQLite as an Excel file (for Railway/live DB)."""
+    """Download current questions (all columns) + all annotations from SQLite as an Excel file."""
     if not _use_sqlite():
         return jsonify({"error": "Export only available when using SQLite (e.g. on Railway)"}), 400
     import sqlite3
     _ensure_sqlite_seeded()
     conn = sqlite3.connect(str(DB_PATH))
     try:
+        col_list = ", ".join(QUESTION_COLUMNS)
         questions = pd.read_sql_query(
-            "SELECT task_id, dr_question, domain FROM questions ORDER BY task_id",
+            f"SELECT {col_list} FROM questions ORDER BY task_id",
             conn,
         )
         if questions.empty:
